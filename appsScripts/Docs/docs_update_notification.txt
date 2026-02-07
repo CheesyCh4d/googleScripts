@@ -1,0 +1,35 @@
+function monitorDateChange() {
+  const doc = DocumentApp.getActiveDocument();
+  const body = doc.getBody();
+  
+  // 1. Search for the "Last Updated:" line
+  // We use a Regular Expression to find the date after that phrase
+  const searchResult = body.findText("Last Updated: .*");
+  
+  if (searchResult) {
+    const currentText = searchResult.getElement().asText().getText();
+    const scriptProperties = PropertiesService.getScriptProperties();
+    const lastKnownDate = scriptProperties.getProperty('lastDate');
+
+    // 2. Compare the current text to the one we saved last time
+    if (currentText !== lastKnownDate) {
+      
+      // 3. If it's different, send the email!
+      sendNotificationEmail(currentText);
+      
+      // 4. Update the "memory" so it doesn't email again until the next change
+      scriptProperties.setProperty('lastDate', currentText);
+      console.log("Change detected. Email sent.");
+    } else {
+      console.log("No change detected.");
+    }
+  }
+}
+
+function sendNotificationEmail(newDateLine) {
+  const recipient = "Jason.House@k21schools.org"; // Or a comma-separated list
+  const subject = "KGBSD Reads Act Manual";
+  const body = "The KGBSD Reads Act Manual has been updated. \n" + newDateLine + "\n\nLink to updated document: " + DocumentApp.getActiveDocument().getUrl();
+  
+  MailApp.sendEmail(recipient, subject, body);
+}

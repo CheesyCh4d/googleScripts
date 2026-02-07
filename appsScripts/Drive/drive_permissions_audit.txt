@@ -1,0 +1,696 @@
+/**
+ * Google Drive Permissions Auditor - Improved Version
+ *
+ * What this script does:
+ * It scans a Google Drive folder (and all its subfolders) and lists every file
+ * and folder along with who has access and what kind of access they have.
+ * It writes all of this into a Google Sheet so you can review it.
+ * You can then change permissions from the sheet and sync those changes back to Drive.
+ *
+ * Features:
+ * - Recursive scan with "Autopilot" (bypasses the 6-minute Apps Script time limit)
+ * - Persists progress in a hidden queue sheet
+ * - Syncs permissions (Editors, Viewers, Commenters) back to Drive
+ * - "Add User" feature for easy sharing
+ * - Batched writes for significantly faster performance
+ *
+ * How the Autopilot works:
+ * Google Apps Script kills any function that runs longer than 6 minutes.
+ * To get around this, the script uses a "queue" — a hidden sheet that tracks
+ * which folders still need to be scanned. When time is almost up (4.5 minutes),
+ * the script saves its place, sets a timed trigger to restart itself in 5 seconds,
+ * and exits. The trigger fires, the script picks up where it left off, and repeats
+ * until every folder has been scanned.
+ */
+
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+/**
+ * MAX_EXECUTION_TIME controls how long the script runs before it stops and
+ * restarts itself. Set to 4.5 minutes (in milliseconds) to stay safely under
+ * the 6-minute limit Google enforces.
+ *
+ * The math: 4.5 minutes × 60 seconds × 1000 milliseconds = 270,000 ms
+ */
+const MAX_EXECUTION_TIME = 4.5 * 60 * 1000;
+
+/**
+ * BATCH_SIZE controls how many rows the script collects in memory before
+ * writing them to the spreadsheet all at once. Writing row-by-row is very
+ * slow in Google Sheets. Batching (collecting rows, then writing them in
+ * one shot) is dramatically faster.
+ *
+ * 50 is a safe middle ground — large enough to be fast, small enough that
+ * you won't lose too much work if something errors out mid-batch.
+ */
+const BATCH_SIZE = 20;
+
+/**
+ * FLUSH_INTERVAL controls the maximum number of seconds the script will
+ * go without writing rows to the sheet. Even if the buffer hasn't reached
+ * BATCH_SIZE yet, a flush is forced after this many seconds so the user
+ * sees progress appearing on the sheet in real time.
+ *
+ * 10 seconds keeps the sheet feeling alive without hammering the API.
+ */
+const FLUSH_INTERVAL = 10 * 1000; // 10 seconds in milliseconds
+
+
+// ============================================================================
+// MENU SETUP
+// ============================================================================
+
+/**
+ * onOpen() runs automatically every time you open the spreadsheet.
+ * It creates a custom menu called "Drive Audit" in the menu bar.
+ *
+ * Each .addItem() line adds a clickable option to that menu.
+ * The first argument is the label you see; the second is the name of the
+ * function that runs when you click it.
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Drive Audit')
+    .addItem('1. Start New Audit', 'startAudit')
+    .addItem('2. Force Resume (If stuck)', 'resumeAudit')
+    .addItem('3. Stop/Cancel Auto-Audit', 'stopAudit')
+    .addSeparator()
+    .addItem('4. Add New User to Selected File', 'addNewUser')
+    .addItem('5. Sync Changes (Update Drive)', 'syncPermissions')
+    .addToUi();
+}
+
+
+// ============================================================================
+// START / STOP AUDIT
+// ============================================================================
+
+/**
+ * startAudit() kicks off a brand new scan.
+ *
+ * Step by step:
+ * 1. Clears any leftover triggers from a previous run.
+ * 2. Asks you to paste a Google Drive folder URL.
+ * 3. Extracts the folder ID from that URL.
+ *    (A folder URL looks like: https://drive.google.com/drive/folders/ABC123...)
+ *    The ID is the part after "/folders/" — so we split on that string and grab it.)
+ * 4. Sets up the main sheet with column headers.
+ * 5. Creates a hidden "_AuditQueue" sheet to track which folders still need scanning.
+ * 6. Drops the starting folder into the queue and calls resumeAudit() to begin.
+ */
+function startAudit() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+
+  // Wipe any triggers left over from a previous run so we don't get duplicates.
+  deleteTriggers();
+
+  // Prompt the user for a folder URL.
+  const response = ui.prompt(
+    'Start New Audit',
+    'Paste the Folder URL here:',
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  // If they clicked Cancel (or the X button), bail out.
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const folderUrl = response.getResponseText();
+
+  // Basic validation: the URL must contain "/folders/" to be a valid folder link.
+  if (!folderUrl || !folderUrl.includes('/folders/')) {
+    ui.alert('Invalid URL. Please enter a valid Google Drive Folder URL.');
+    return;
+  }
+
+  // Extract the folder ID.
+  // Example URL: https://drive.google.com/drive/folders/1aBcDeFgHiJkL?resourcekey=0-xxx
+  // .split('/folders/')[1] gives us: "1aBcDeFgHiJkL?resourcekey=0-xxx"
+  // .split('?')[0] strips the query string, giving us: "1aBcDeFgHiJkL"
+  const folderId = folderUrl.split('/folders/')[1].split('?')[0];
+
+  // --- Set up the main output sheet ---
+  // Rename the active sheet to 'Audit Results' so resumeAudit() and
+  // syncPermissions() can always find it by name, regardless of which
+  // tab the user happened to be on when they started the audit.
+  const sheet = ss.getActiveSheet();
+  sheet.setName('Audit Results');
+  sheet.clear();
+
+  const headers = [
+    'Type',                // Column A: "File" or "Folder"
+    'Path/Folder',         // Column B: The folder path where this item lives
+    'Item Name',           // Column C: The file or folder name
+    'Link',                // Column D: A clickable URL to the item
+    'User Email',          // Column E: The email of the person with access
+    'Current Role',        // Column F: Their current permission (Owner/Editor/Viewer/Commenter)
+    'Adjusted Permission', // Column G: Dropdown where you pick a new permission
+    'File ID'              // Column H: The Drive file/folder ID (hidden from view, used by sync)
+  ];
+
+  sheet.appendRow(headers);
+  sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#d9d9d9');
+  sheet.setFrozenRows(1); // Keeps the header row visible when scrolling.
+
+  // --- Set up the hidden queue sheet ---
+  // The queue sheet tracks: [FolderID, FolderPath]
+  // Each row = one folder that still needs to be scanned.
+  let queueSheet = ss.getSheetByName('_AuditQueue');
+  if (queueSheet) {
+    queueSheet.clear();
+  } else {
+    queueSheet = ss.insertSheet('_AuditQueue');
+    queueSheet.hideSheet(); // Users don't need to see this.
+  }
+
+  // Seed the queue with the starting folder.
+  queueSheet.appendRow([folderId, '/']);
+
+  ss.toast('Audit started. This may take a while...', 'System Started');
+
+  // Hand off to the engine.
+  resumeAudit();
+}
+
+/**
+ * stopAudit() cancels everything.
+ * It deletes the auto-restart triggers and removes the queue sheet.
+ */
+function stopAudit() {
+  deleteTriggers();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const queueSheet = ss.getSheetByName('_AuditQueue');
+  if (queueSheet) ss.deleteSheet(queueSheet);
+  ss.toast('Audit process stopped.', 'Stopped');
+}
+
+
+// ============================================================================
+// THE ENGINE — resumeAudit()
+// ============================================================================
+
+/**
+ * resumeAudit() is the workhorse. It pulls folders off the queue one at a time,
+ * scans their contents (files and subfolders), and writes what it finds to the sheet.
+ *
+ * Key concepts:
+ *
+ * "rowBuffer" — Instead of writing one row at a time to the sheet (which is slow),
+ * we collect rows in a JavaScript array (the buffer). When the buffer hits BATCH_SIZE,
+ * we flush it — meaning we write all those rows to the sheet in a single operation.
+ * This is dramatically faster. Think of it like loading a moving truck vs carrying
+ * boxes one at a time. We also flush on a timer (FLUSH_INTERVAL) so that even when
+ * scanning folders with few files, rows still appear on the sheet every ~10 seconds
+ * instead of piling up invisibly in memory.
+ *
+ * "Time check" — Before processing each folder, we check how long we've been
+ * running. If we're approaching the 4.5-minute limit, we save our progress
+ * (flush the buffer) and set a trigger to restart in 5 seconds.
+ */
+function resumeAudit() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Audit Results') || ss.getSheets()[0];
+  const queueSheet = ss.getSheetByName('_AuditQueue');
+
+  // If there's no queue or it's empty, we're done.
+  if (!queueSheet || queueSheet.getLastRow() === 0) {
+    finishAudit(sheet, queueSheet);
+    return;
+  }
+
+  const startTime = Date.now();
+  let rowBuffer = [];  // Collects rows before writing them in bulk.
+  let lastFlushTime = Date.now(); // Tracks when we last wrote rows to the sheet.
+  let lastToastTime = 0; // Tracks when we last showed a toast notification.
+
+  // --- Main loop: process one folder per iteration ---
+  while (queueSheet.getLastRow() > 0) {
+
+    // TIME CHECK: Are we running out of time?
+    if (Date.now() - startTime > MAX_EXECUTION_TIME) {
+
+      // Flush any remaining rows in the buffer before we exit.
+      flushBuffer(sheet, rowBuffer);
+      rowBuffer = [];
+
+      // Schedule a trigger to restart this function in 5 seconds.
+      // This is the "Autopilot" — it creates a one-time time-based trigger.
+      ScriptApp.newTrigger('resumeAudit')
+        .timeBased()
+        .after(5000)
+        .create();
+
+      ss.toast(
+        'Time limit reached. Auto-restarting in 5s...',
+        'Autopilot Engaged'
+      );
+      return; // Exit. The trigger will call resumeAudit() again shortly.
+    }
+
+    // --- Pull the next folder off the top of the queue ---
+    // Queue only has 2 columns now: [FolderID, FolderPath]
+    const range = queueSheet.getRange(1, 1, 1, 2);
+    const [currentFolderId, currentPath] = range.getValues()[0];
+
+    try {
+      const folder = DriveApp.getFolderById(currentFolderId);
+
+      // Throttle toast notifications to avoid spamming the UI.
+      // Only show a new toast if 10+ seconds have passed since the last one.
+      if (Date.now() - lastToastTime > 10000) {
+        ss.toast(`Scanning: ${currentPath}`, 'Working...');
+        lastToastTime = Date.now();
+      }
+
+      // --- Scan files in this folder ---
+      const files = folder.getFiles();
+      while (files.hasNext()) {
+        collectItemRows(files.next(), 'File', currentPath, rowBuffer);
+
+        // Flush if the buffer is full OR enough time has passed.
+        // The time check ensures rows appear on the sheet at a steady pace
+        // even when folders contain only a few files each.
+        if (rowBuffer.length >= BATCH_SIZE || Date.now() - lastFlushTime > FLUSH_INTERVAL) {
+          flushBuffer(sheet, rowBuffer);
+          rowBuffer = [];
+          lastFlushTime = Date.now();
+        }
+      }
+
+      // --- Scan subfolders ---
+      const subfolders = folder.getFolders();
+      while (subfolders.hasNext()) {
+        const sub = subfolders.next();
+
+        // Add this subfolder to the END of the queue so it gets scanned later.
+        queueSheet.appendRow([sub.getId(), currentPath + sub.getName() + '/']);
+
+        collectItemRows(sub, 'Folder', currentPath, rowBuffer);
+
+        if (rowBuffer.length >= BATCH_SIZE || Date.now() - lastFlushTime > FLUSH_INTERVAL) {
+          flushBuffer(sheet, rowBuffer);
+          rowBuffer = [];
+          lastFlushTime = Date.now();
+        }
+      }
+
+      // This folder is done — remove it from the queue.
+      queueSheet.deleteRow(1);
+
+    } catch (e) {
+      // If a folder can't be accessed (permissions, deleted, etc.), log it and move on.
+      console.log(`Error accessing ${currentFolderId}: ${e.message}`);
+      queueSheet.deleteRow(1);
+    }
+  }
+
+  // --- Queue is empty. We're done. ---
+  flushBuffer(sheet, rowBuffer); // Write any leftover rows.
+  finishAudit(sheet, queueSheet);
+}
+
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/**
+ * collectItemRows() gathers permission data for a single file or folder.
+ *
+ * Instead of writing to the sheet immediately, it pushes rows into the
+ * rowBuffer array. This is what enables batched writes.
+ *
+ * For each item, it collects:
+ * - The Owner (every Drive item has one)
+ * - All Editors
+ * - All Viewers and Commenters
+ *
+ * Detecting Commenters:
+ * Google Drive doesn't have a direct "getCommenters()" method.
+ * Commenters show up in the getViewers() list. To tell them apart, we use
+ * file.getAccess(email), which returns a Permission enum. If it returns
+ * DriveApp.Permission.COMMENT, that person is a Commenter, not a plain Viewer.
+ *
+ * @param {File|Folder} item    - The Drive file or folder object.
+ * @param {string}      type    - "File" or "Folder".
+ * @param {string}      path    - The folder path this item lives in.
+ * @param {Array}       buffer  - The array to push row data into.
+ */
+function collectItemRows(item, type, path, buffer) {
+  const fileId = item.getId();
+  const name = item.getName();
+  const url = item.getUrl();
+
+  // Helper: builds one row as an array matching our 8-column header.
+  const makeRow = (email, role, adjustedRole) => {
+    return [type, path, name, url, email, role, adjustedRole, fileId];
+  };
+
+  // --- Owner ---
+  try {
+    const owner = item.getOwner();
+    if (owner) {
+      buffer.push(makeRow(owner.getEmail(), 'Owner', 'Owner'));
+    }
+  } catch (e) { /* Some shared drives have no single owner. */ }
+
+  // --- Editors ---
+  try {
+    const editors = item.getEditors();
+    for (let i = 0; i < editors.length; i++) {
+      buffer.push(makeRow(editors[i].getEmail(), 'Editor', 'Editor'));
+    }
+  } catch (e) { /* Access denied to editor list — skip. */ }
+
+  // --- Viewers & Commenters ---
+  try {
+    const viewers = item.getViewers();
+    for (let i = 0; i < viewers.length; i++) {
+      const email = viewers[i].getEmail();
+      let role = 'Viewer';
+
+      // Check if this "viewer" is actually a commenter.
+      // getAccess() takes an EMAIL STRING (not a User object) and returns
+      // a DriveApp.Permission enum value. We compare against the COMMENT enum.
+      try {
+        if (item.getAccess(email) === DriveApp.Permission.COMMENT) {
+          role = 'Commenter';
+        }
+      } catch (e) { /* If getAccess fails, default to Viewer. */ }
+
+      buffer.push(makeRow(email, role, role));
+    }
+  } catch (e) { /* Access denied to viewer list — skip. */ }
+}
+
+/**
+ * flushBuffer() writes all collected rows to the sheet in one operation.
+ *
+ * setValues() writes a 2D array into a range all at once. This is the key
+ * performance improvement over appendRow() in a loop.
+ *
+ * @param {Sheet} sheet   - The sheet to write to.
+ * @param {Array} buffer  - A 2D array of rows to write. Each inner array = one row.
+ */
+function flushBuffer(sheet, buffer) {
+  if (buffer.length === 0) return;
+
+  // getLastRow() tells us how many rows already have data.
+  // We start writing on the next empty row.
+  const startRow = sheet.getLastRow() + 1;
+
+  // setValues() needs a range that exactly matches the buffer dimensions.
+  // buffer.length = number of rows, buffer[0].length = number of columns (8).
+  sheet.getRange(startRow, 1, buffer.length, buffer[0].length).setValues(buffer);
+}
+
+/**
+ * finishAudit() runs when the queue is empty and the scan is complete.
+ * It cleans up triggers, applies the permission dropdowns, removes the
+ * queue sheet, and shows a completion alert.
+ */
+function finishAudit(sheet, queueSheet) {
+  deleteTriggers();
+  applyDropdowns(sheet);
+  if (queueSheet) {
+    SpreadsheetApp.getActiveSpreadsheet().deleteSheet(queueSheet);
+  }
+  SpreadsheetApp.getUi().alert('Audit Finished Successfully!');
+}
+
+/**
+ * deleteTriggers() removes all time-based triggers that point to resumeAudit.
+ *
+ * ScriptApp.getProjectTriggers() returns every trigger attached to this script.
+ * We loop through and delete only the ones whose handler function is 'resumeAudit'.
+ * This prevents stacking up duplicate triggers if the script restarts multiple times.
+ */
+function deleteTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'resumeAudit') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+}
+
+/**
+ * applyDropdowns() adds data-validation dropdowns to the "Adjusted Permission"
+ * column (Column G) for every data row.
+ *
+ * It skips rows where Column F (Current Role) is "Owner" because you can't
+ * change ownership through the DriveApp API — it requires the Drive Advanced Service
+ * or the REST API, which is outside the scope of this script.
+ *
+ * It also hides Column H (File ID) since users don't need to see it, and
+ * auto-resizes the visible columns to fit their content.
+ */
+function applyDropdowns(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return; // No data rows.
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Editor', 'Viewer', 'Commenter', 'Remove Access'], true)
+    .setAllowInvalid(false)
+    .build();
+
+  // Read all Current Role values in column F at once.
+  const roles = sheet.getRange(2, 6, lastRow - 1, 1).getValues();
+
+  for (let i = 0; i < roles.length; i++) {
+    if (roles[i][0] === 'Owner') {
+      // Clear any dropdown on Owner rows so the user can't accidentally pick one.
+      sheet.getRange(i + 2, 7).clearDataValidations();
+    } else {
+      sheet.getRange(i + 2, 7).setDataValidation(rule);
+    }
+  }
+
+  sheet.hideColumns(8);       // Hide the File ID column.
+  sheet.autoResizeColumns(1, 7); // Auto-fit columns A through G.
+}
+
+
+// ============================================================================
+// ADD NEW USER
+// ============================================================================
+
+/**
+ * addNewUser() lets you share a file with someone new directly from the sheet.
+ *
+ * How to use it:
+ * 1. Click on any cell in the row of the file you want to share.
+ * 2. Run "Add New User to Selected File" from the Drive Audit menu.
+ * 3. Enter the person's email when prompted.
+ *
+ * It inserts a new row right below the one you selected, pre-filled with
+ * the file's info and the new email. The default permission is "Viewer"
+ * (you can change it via the dropdown). The row is highlighted yellow so
+ * you can easily spot new entries. Nothing happens in Drive until you run Sync.
+ */
+function addNewUser() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const ui = SpreadsheetApp.getUi();
+  const range = sheet.getActiveRange();
+  const row = range.getRow();
+
+  // Validation: must select a single data row (not the header, not multiple rows).
+  if (row <= 1 || range.getNumRows() > 1) {
+    ui.alert('Please select a single row containing the file you want to share.');
+    return;
+  }
+
+  // Read the full row to get the file's metadata.
+  const rowValues = sheet.getRange(row, 1, 1, 8).getValues()[0];
+  const fileId = rowValues[7]; // Column H
+
+  if (!fileId) {
+    ui.alert('No File ID found in this row.');
+    return;
+  }
+
+  // Ask for the email address.
+  const emailResp = ui.prompt(
+    'Add New User',
+    `Enter email for: ${rowValues[2]}`,
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (emailResp.getSelectedButton() !== ui.Button.OK) return;
+
+  const newEmail = emailResp.getResponseText().trim();
+  if (!newEmail) {
+    ui.alert('Email cannot be empty.');
+    return;
+  }
+
+  // Insert a new row directly below the selected one.
+  sheet.insertRowAfter(row);
+  const newRowIndex = row + 1;
+
+  // Fill it with the same file info but the new email and a default role of Viewer.
+  // '---' in Current Role means "this user doesn't have access yet."
+  sheet.getRange(newRowIndex, 1, 1, 8).setValues([[
+    rowValues[0], // Type
+    rowValues[1], // Path
+    rowValues[2], // Item Name
+    rowValues[3], // Link
+    newEmail,      // New user's email
+    '---',         // Current Role (none yet)
+    'Viewer',      // Default Adjusted Permission
+    fileId         // File ID
+  ]]);
+
+  // Apply the dropdown to the new row's Adjusted Permission cell.
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Editor', 'Viewer', 'Commenter', 'Remove Access'], true)
+    .setAllowInvalid(false)
+    .build();
+  sheet.getRange(newRowIndex, 7).setDataValidation(rule);
+
+  // Highlight the row yellow so it's easy to spot.
+  sheet.getRange(newRowIndex, 1, 1, 7).setBackground('#fff2cc');
+}
+
+
+// ============================================================================
+// SYNC PERMISSIONS BACK TO DRIVE
+// ============================================================================
+
+/**
+ * syncPermissions() reads the sheet and applies any permission changes to Drive.
+ *
+ * It compares Column F (Current Role) to Column G (Adjusted Permission).
+ * If they differ, it makes the change in Drive.
+ *
+ * Important logic:
+ *
+ * DOWNGRADES (e.g., Editor → Viewer):
+ *   Google Drive doesn't let you "downgrade" by just adding a lower role.
+ *   If someone is an Editor and you addViewer(email), they STAY an Editor.
+ *   You must REMOVE the old role first, THEN add the new one.
+ *   This was a bug in the original script. Fixed here.
+ *
+ * COMMENTERS ON FOLDERS:
+ *   Google Drive doesn't support "Commenter" on folders — only on files.
+ *   If you try to make someone a Commenter on a folder, the script falls
+ *   back to Viewer and notes it in the Current Role column.
+ *
+ * OWNERS:
+ *   You can't change ownership via DriveApp. Owner rows are skipped.
+ *
+ * NEW USERS (Current Role = '---'):
+ *   These are rows created by "Add New User." Since they have no existing
+ *   role, there's nothing to remove — we just add the requested permission.
+ */
+function syncPermissions() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName('Audit Results') || ss.getSheets()[0];
+  const ui = SpreadsheetApp.getUi();
+  const data = sheet.getDataRange().getValues();
+
+  let updatesCount = 0;
+  let errorCount = 0;
+
+  // Start at row index 1 (row 2 in the sheet) to skip the header.
+  for (let i = 1; i < data.length; i++) {
+    const [type, path, name, link, email, currentRole, newRole, fileId] = data[i];
+
+    // Skip if nothing changed, or if required data is missing.
+    if (currentRole === newRole || !fileId || !email) continue;
+
+    // Skip Owner rows — can't change ownership this way.
+    if (currentRole === 'Owner') continue;
+
+    // Skip rows where the user picked "Remove Access" on a brand-new user
+    // who doesn't actually have access yet. There's nothing to remove.
+    if (currentRole === '---' && newRole === 'Remove Access') continue;
+
+    try {
+      const isFolder = (type === 'Folder' || type === 'Root Folder');
+
+      // DriveApp uses different classes for files vs folders, but both have
+      // the same permission methods (addEditor, removeEditor, etc.).
+      const item = isFolder ? DriveApp.getFolderById(fileId) : DriveApp.getFileById(fileId);
+
+      // --- REMOVE ACCESS ---
+      if (newRole === 'Remove Access') {
+        removeOldRole(item, email, currentRole);
+        // Set BOTH columns to 'Removed' so they match and this row
+        // gets skipped on any future sync (currentRole === newRole → skip).
+        sheet.getRange(i + 1, 6).setValue('Removed');
+        sheet.getRange(i + 1, 7).setValue('Removed');
+        updatesCount++;
+        continue;
+      }
+
+      // --- COMMENTER ON FOLDER (not supported by Drive) ---
+      if (newRole === 'Commenter' && isFolder) {
+        removeOldRole(item, email, currentRole);
+        item.addViewer(email);
+        sheet.getRange(i + 1, 6).setValue('Viewer (Folder Restriction)');
+        sheet.getRange(i + 1, 7).setValue('Viewer');
+        updatesCount++;
+        continue;
+      }
+
+      // --- STANDARD PERMISSION CHANGE ---
+      // Step 1: Remove the old role (critical for downgrades).
+      // For new users (currentRole === '---'), there's nothing to remove.
+      if (currentRole !== '---') {
+        removeOldRole(item, email, currentRole);
+      }
+
+      // Step 2: Add the new role.
+      if (newRole === 'Editor') {
+        item.addEditor(email);
+      } else if (newRole === 'Viewer') {
+        item.addViewer(email);
+      } else if (newRole === 'Commenter') {
+        item.addCommenter(email); // Only works on files, handled above for folders.
+      }
+
+      // Update Column F to reflect the new reality.
+      sheet.getRange(i + 1, 6).setValue(newRole);
+      updatesCount++;
+
+    } catch (e) {
+      console.log(`Error updating "${name}" for ${email}: ${e.message}`);
+      errorCount++;
+    }
+  }
+
+  // Summary message.
+  let message = `Sync Complete!\nUpdated permissions for ${updatesCount} entries.`;
+  if (errorCount > 0) {
+    message += `\n${errorCount} entries had errors (check Apps Script logs).`;
+  }
+  ui.alert(message);
+}
+
+/**
+ * removeOldRole() strips a user's existing permission from a file or folder.
+ *
+ * Why this exists:
+ * In Google Drive, permissions stack upward. If someone is an Editor and you
+ * call addViewer(email), they don't become a Viewer — they stay an Editor.
+ * You must explicitly remove the higher role first.
+ *
+ * This function checks what the user's current role is and calls the
+ * appropriate remove method.
+ *
+ * @param {File|Folder} item         - The Drive item.
+ * @param {string}      email        - The user's email.
+ * @param {string}      currentRole  - Their current role as recorded in the sheet.
+ */
+function removeOldRole(item, email, currentRole) {
+  if (currentRole === 'Editor') {
+    item.removeEditor(email);
+  } else if (currentRole === 'Viewer' || currentRole === 'Commenter') {
+    item.removeViewer(email);
+  }
+  // 'Owner' and '---' don't need removal.
+  // If currentRole is something unexpected, we skip removal to avoid errors.
+}

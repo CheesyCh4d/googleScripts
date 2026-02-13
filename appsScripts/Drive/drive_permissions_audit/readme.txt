@@ -77,3 +77,8 @@ To grant access to a user not currently listed:
 6. Disclaimer
 
 This software modifies permissions on live Google Drive files. While safety mechanisms are implemented to prevent the removal of owners, users should exercise caution when performing bulk synchronization operations. Verify all "Adjusted Permission" values before syncing.
+
+
+Written by Chad Jacks
+Chad.Jacks@k21schools.org
+2026-02-13

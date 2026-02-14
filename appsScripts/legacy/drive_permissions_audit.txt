@@ -1,5 +1,5 @@
 /**
- * Google Drive Permissions Auditor - Improved Version
+ * Google Drive Permissions Auditor
  *
  * What this script does:
  * It scans a Google Drive folder (and all its subfolders) and lists every file

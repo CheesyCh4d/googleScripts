@@ -27,9 +27,13 @@ function monitorDateChange() {
 }
 
 function sendNotificationEmail(newDateLine) {
-  const recipient = "Jason.House@k21schools.org"; // Or a comma-separated list
+  const recipient = "emailaddress@k21schools.org"; // Or a comma-separated list
   const subject = "KGBSD Reads Act Manual";
   const body = "The KGBSD Reads Act Manual has been updated. \n" + newDateLine + "\n\nLink to updated document: " + DocumentApp.getActiveDocument().getUrl();
   
   MailApp.sendEmail(recipient, subject, body);
 }
+
+//written by Chad Jacks
+//Chad.Jacks@k21schools.org
+//2026-02-13

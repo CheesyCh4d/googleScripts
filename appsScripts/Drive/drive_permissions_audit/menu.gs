@@ -10,5 +10,8 @@ function onOpen() {
     .addSeparator()
     .addItem('4. Add New User to Selected File', 'addNewUser')
     .addItem('5. Sync Changes (Update Drive)', 'syncPermissions')
+    .addSeparator()
+    .addItem('6. Bulk Edit Permissions (Selected Rows)', 'bulkEditPermissions')
+    .addItem('7. Bulk Edit by Email (Find & Replace)', 'bulkEditByEmail') // <--- NEW
     .addToUi();
 }

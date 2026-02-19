@@ -6,21 +6,20 @@ The Google Drive Permissions Auditor is an automated tool designed to scan, anal
 The application serves two primary functions:
 
     Auditing: It generates a comprehensive report of all files and folders within a target directory, listing every user with access and their specific permission role.
-    Management: It allows administrators to modify permissions (add, remove, or change roles) directly within the spreadsheet and synchronize those changes back to Google Drive.
+    Management: It allows administrators to perform granular or bulk modifications to permissions directly within the spreadsheet and synchronize those changes back to Google Drive.
 
 2. Technical Features
 
-    Recursive Scanning with State Persistence: The script uses a queue-based system to track scanning progress. When the Google Apps Script 6-minute execution limit approaches, the script saves its state to a hidden sheet and schedules a trigger to resume automatically.
-    Batched Write Operations: To optimize performance, data is buffered in memory and written to the spreadsheet in batches, significantly reducing the time required to populate the report.
-    Permission Synchronization: The tool compares the "Current Role" against the "Adjusted Permission" column. If discrepancies are found, it updates the Google Drive permissions to match the spreadsheet configuration.
-    Safe Permission Handling: The script includes logic to handle permission downgrades (e.g., changing an Editor to a Viewer) by first removing the higher-level role. It also prevents the accidental removal of file owners.
+    Recursive Scanning with State Persistence: The script uses a queue-based system to track scanning progress. When the Google Apps Script execution limit approaches, the script saves its state and schedules a trigger to resume automatically.
+    Bulk Processing Logic: The tool is designed to handle mass updates to the "Adjusted Permission" column without triggering data validation errors, specifically when handling the removal of users.
+    Integrity-Safe Row Insertion: When adding users to multiple files simultaneously, the script processes the selection in descending order (bottom-up). This ensures that row indices remain accurate as new rows are inserted.
+    Security Guardrails: The script includes logic to prevent the modification or removal of file "Owners." It also validates inputs to ensure only recognized roles (Editor, Viewer, Commenter) are applied.
 
 3. Installation
 
     Create a new Google Sheet.
     Navigate to Extensions > Apps Script.
     Remove any existing code in the default Code.gs file.
-
     Create the following script files within the editor and paste the corresponding code into each:
 
         Config.gs
@@ -30,54 +29,58 @@ The application serves two primary functions:
         Sync_Manager.gs
         User_Tools.gs
         Utilities.gs
-    Save the project.
-    Reload the Google Sheet. A new menu item labeled "Drive Audit" will appear in the toolbar.
+
+    Save the project and reload the Google Sheet. A menu labeled "Drive Audit" will appear in the toolbar.
 
 4. Usage Instructions
 4.1. Initiating an Audit
 
-    Select Drive Audit > 1. Start New Audit from the menu.
-    Input the URL of the target Google Drive folder when prompted.
-    The script will begin scanning. Progress is maintained via background triggers; the browser tab may be closed without interrupting the process.
+    Select Drive Audit > 1. Start New Audit.
+    Input the URL of the target Google Drive folder.
+    The script will begin scanning. Progress is maintained via background triggers; the browser tab may be closed during this process.
 
-4.2. Reviewing Results
+4.2. Bulk Editing by Selection
 
-Upon completion, the Audit Results sheet will populate with the following columns:
+To update multiple specific rows at once:
 
-    Type: Indicates if the item is a File or Folder.
-    Path/Folder: The directory path of the item.
-    Item Name: The name of the file or folder.
-    User Email: The account holding access rights.
-    Current Role: The access level currently assigned (Owner, Editor, Viewer, or Commenter).
+    Highlight the desired rows or cells (use Ctrl/Cmd or Shift for multi-selection).
+    Select Drive Audit > 6. Bulk Edit Permissions (Selected Rows).
+    Enter the corresponding letter for the new role:
 
-4.3. Modifying Permissions
+        E: Editor
+        V: Viewer
+        C: Commenter
+        R: Remove Access
 
-To alter access rights:
+4.3. Bulk Editing by Email (Find and Replace)
 
-    Locate the Adjusted Permission column (Column G).
-    Select the desired role from the dropdown menu (e.g., Viewer, Remove Access).
-    Once all adjustments are set in the spreadsheet, select Drive Audit > 5. Sync Changes.
-    The script will process the changes and update Google Drive accordingly.
+To change permissions for a specific user across the entire audit:
 
-4.4. Adding New Users
+    Select Drive Audit > 7. Bulk Edit by Email (Find & Replace).
+    Enter the user's exact email address.
+    Enter the letter for the new role (E, V, C, or R).
+    The script will update every instance of that user found in the sheet, excluding files they own.
 
-To grant access to a user not currently listed:
+4.4. Adding a User to Multiple Files
 
-    Select the row containing the target file.
-    Navigate to Drive Audit > 4. Add New User to Selected File.
+    Select the rows representing the files you wish to share.
+    Select Drive Audit > 4. Add New User to Selected File.
     Enter the email address of the new user.
-    A new row will be generated. Set the desired permission in Column G.
-    Run Sync Changes to apply the new permission.
+    Enter the letter for their initial permission level (E, V, or C).
+    New rows (highlighted yellow) will be inserted beneath each selected file with the specified settings.
+
+4.5. Synchronizing Changes
+
+Updates made in the spreadsheet are not applied to Google Drive until synchronized.
+    Review the Adjusted Permission column to ensure accuracy.
+    Select Drive Audit > 5. Sync Changes (Update Drive).
+    The script will process the updates and change the "Current Role" status to reflect the successful modification.
 
 5. Troubleshooting
 
-    Script Termination: If the script halts unexpectedly due to API errors, select Drive Audit > 2. Force Resume. This reads the hidden queue sheet and resumes scanning from the last recorded position.
-    Triggers: The script generates temporary time-based triggers to manage the execution loop. These are automatically removed upon completion. To manually halt the process and clear triggers, select Drive Audit > 3. Stop/Cancel Auto-Audit.
-
-6. Disclaimer
-
-This software modifies permissions on live Google Drive files. While safety mechanisms are implemented to prevent the removal of owners, users should exercise caution when performing bulk synchronization operations. Verify all "Adjusted Permission" values before syncing.
-
+    Data Validation Errors: If a cell displays a validation error, it is likely because a role was entered that is not supported by the dropdown menu. Ensure only "Editor," "Viewer," "Commenter," or "Remove Access" are present in Column G.
+    Script Interruption: If the scan halts, select Drive Audit > 2. Force Resume.
+    Manual Halt: To stop an active audit and clear all background triggers, select Drive Audit > 3. Stop/Cancel Auto-Audit.
 
 Written by Chad Jacks
 Chad.Jacks@k21schools.org

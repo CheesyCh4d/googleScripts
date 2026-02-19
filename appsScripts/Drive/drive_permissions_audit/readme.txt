@@ -22,13 +22,13 @@ The application serves two primary functions:
     Remove any existing code in the default Code.gs file.
     Create the following script files within the editor and paste the corresponding code into each:
 
-        Config.gs
-        Menu.gs
-        Audit_Engine.gs
-        Audit_Helpers.gs
-        Sync_Manager.gs
-        User_Tools.gs
-        Utilities.gs
+        config.gs
+        menu.gs
+        audit_main.gs
+        Audit_helpers.gs
+        sync_main.gs
+        user_main.gs
+        utilities.gs
 
     Save the project and reload the Google Sheet. A menu labeled "Drive Audit" will appear in the toolbar.
 

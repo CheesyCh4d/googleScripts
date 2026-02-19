@@ -10,27 +10,37 @@ function syncPermissions() {
   let updatesCount = 0;
   let errorCount = 0;
 
+  // Start at row index 1 (row 2 in sheet)
   for (let i = 1; i < data.length; i++) {
     const [type, path, name, link, email, currentRole, newRole, fileId] = data[i];
 
     if (currentRole === newRole || !fileId || !email) continue;
     if (currentRole === 'Owner') continue;
+    // Skip if user was added (---) but then set to Remove Access immediately
     if (currentRole === '---' && newRole === 'Remove Access') continue;
 
     try {
       const isFolder = (type === 'Folder' || type === 'Root Folder');
       const item = isFolder ? DriveApp.getFolderById(fileId) : DriveApp.getFileById(fileId);
 
-      // Remove Access
+      // --- REMOVE ACCESS ---
       if (newRole === 'Remove Access') {
         removeOldRole(item, email, currentRole);
+        
+        // Update "Current Role" to Removed
         sheet.getRange(i + 1, 6).setValue('Removed');
-        sheet.getRange(i + 1, 7).setValue('Removed');
+
+        // FIX: Clear the dropdown validation before writing "Removed" 
+        // to avoid "Violates Data Validation" error.
+        const adjCell = sheet.getRange(i + 1, 7);
+        adjCell.clearDataValidations();
+        adjCell.setValue('Removed');
+
         updatesCount++;
         continue;
       }
 
-      // Handle Commenter on Folder edge case
+      // --- COMMENTER ON FOLDER FIX ---
       if (newRole === 'Commenter' && isFolder) {
         removeOldRole(item, email, currentRole);
         item.addViewer(email);
@@ -40,7 +50,7 @@ function syncPermissions() {
         continue;
       }
 
-      // Standard Change
+      // --- STANDARD CHANGE ---
       if (currentRole !== '---') {
         removeOldRole(item, email, currentRole);
       }
@@ -67,6 +77,11 @@ function syncPermissions() {
  * Helper to remove existing permissions before adding new ones.
  */
 function removeOldRole(item, email, currentRole) {
-  if (currentRole === 'Editor') item.removeEditor(email);
-  else if (currentRole === 'Viewer' || currentRole === 'Commenter') item.removeViewer(email);
+  try {
+    if (currentRole === 'Editor') item.removeEditor(email);
+    else if (currentRole === 'Viewer' || currentRole === 'Commenter') item.removeViewer(email);
+  } catch (e) {
+    // If the user was already removed manually, ignore the error
+    console.log(`Could not remove ${email}: ${e.message}`);
+  }
 }
